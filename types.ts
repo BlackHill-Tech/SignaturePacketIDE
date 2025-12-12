@@ -25,8 +25,23 @@ export interface ExtractedSignaturePage {
 
 export type GroupingMode = 'agreement' | 'counterparty' | 'signatory';
 
+/**
+ * @deprecated Use SignatureMetadataExtraction instead
+ */
 export interface SignatureBlockExtraction {
   isSignaturePage: boolean;
+  signatures: Array<{
+    partyName: string;
+    signatoryName: string;
+    capacity: string;
+  }>;
+}
+
+/**
+ * Result from Gemini API for extracting metadata from a confirmed signature page.
+ * Note: isSignaturePage determination is now done procedurally in pdfService.
+ */
+export interface SignatureMetadataExtraction {
   signatures: Array<{
     partyName: string;
     signatoryName: string;

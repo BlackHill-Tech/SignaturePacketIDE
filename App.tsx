@@ -3,8 +3,8 @@ import { UploadCloud, File as FileIcon, Loader2, Download, Layers, Users, X, Che
 import { v4 as uuidv4 } from 'uuid';
 import JSZip from 'jszip';
 import { ExtractedSignaturePage, GroupingMode, ProcessedDocument } from './types';
-import { getPageCount, renderPageToImage, generateGroupedPdfs, findSignaturePageCandidates, extractSinglePagePdf } from './services/pdfService';
-import { analyzePage } from './services/geminiService';
+import { getPageCount, renderPageToImage, generateGroupedPdfs, findSignaturePages, extractSinglePagePdf } from './services/pdfService';
+import { extractSignatureMetadata } from './services/geminiService';
 import SignatureCard from './components/SignatureCard';
 import PdfPreviewModal from './components/PdfPreviewModal';
 import InstructionsModal from './components/InstructionsModal';
@@ -92,60 +92,80 @@ const App: React.FC = () => {
 
       try {
         const pageCount = await getPageCount(doc.file);
-        
-        // 1. Full Document Text Scan (Heuristic) - Optimized in pdfService
-        const candidateIndices = await findSignaturePageCandidates(doc.file, (curr, total) => {
-           // Update progress for scanning phase (0-30%)
-           const progress = Math.round((curr / total) * 30);
+
+        // 1. Procedural Signature Page Detection (weighted pattern matching)
+        // This replaces the old heuristic + AI confirmation approach
+        const signaturePages = await findSignaturePages(doc.file, (curr, total) => {
+           // Update progress for scanning phase (0-50%)
+           const progress = Math.round((curr / total) * 50);
            setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, progress } : d));
         });
 
-        // 2. Visual AI Analysis on Candidate Pages (Parallelized)
+        // 2. AI Metadata Extraction on Confirmed Signature Pages
+        // Now we only call Gemini to extract party/signatory/capacity (not to confirm if it's a sig page)
         const extractedPages: ExtractedSignaturePage[] = [];
 
-        if (candidateIndices.length === 0) {
-           console.log(`No signature candidates found in ${doc.name} via regex.`);
+        if (signaturePages.length === 0) {
+           console.log(`No signature pages found in ${doc.name} via procedural detection.`);
            setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, progress: 100 } : d));
         } else {
-            // Process candidates in chunks to respect AI concurrency limit PER DOC
+            // Process confirmed signature pages in chunks for AI metadata extraction
             let processedCount = 0;
-            const totalCandidates = candidateIndices.length;
+            const totalPages = signaturePages.length;
 
-            for (let i = 0; i < candidateIndices.length; i += CONCURRENT_AI_REQUESTS_PER_DOC) {
-                const chunk = candidateIndices.slice(i, i + CONCURRENT_AI_REQUESTS_PER_DOC);
-                
-                const chunkPromises = chunk.map(async (pageIndex) => {
+            for (let i = 0; i < signaturePages.length; i += CONCURRENT_AI_REQUESTS_PER_DOC) {
+                const chunk = signaturePages.slice(i, i + CONCURRENT_AI_REQUESTS_PER_DOC);
+
+                const chunkPromises = chunk.map(async (sigPage) => {
                     try {
-                        const { dataUrl, width, height } = await renderPageToImage(doc.file, pageIndex);
-                        const analysis = await analyzePage(dataUrl);
+                        const { dataUrl, width, height } = await renderPageToImage(doc.file, sigPage.pageIndex);
+                        // Extract metadata only (page is already confirmed as signature page)
+                        const metadata = await extractSignatureMetadata(dataUrl);
 
-                        if (analysis.isSignaturePage) {
-                            return analysis.signatures.map(sig => ({
+                        // If AI couldn't extract any signatures, create a default entry
+                        // (the page was procedurally detected as a sig page, so include it)
+                        if (metadata.signatures.length === 0) {
+                            return [{
                                 id: uuidv4(),
                                 documentId: doc.id,
                                 documentName: doc.name,
-                                pageIndex: pageIndex,
-                                pageNumber: pageIndex + 1,
-                                partyName: sig.partyName || "Unknown Party",
-                                signatoryName: sig.signatoryName || "",
-                                capacity: sig.capacity || "Signatory",
+                                pageIndex: sigPage.pageIndex,
+                                pageNumber: sigPage.pageIndex + 1,
+                                partyName: "Unknown Party",
+                                signatoryName: "",
+                                capacity: "Signatory",
                                 copies: 1,
                                 thumbnailUrl: dataUrl,
                                 originalWidth: width,
                                 originalHeight: height
-                            }));
+                            }];
                         }
+
+                        return metadata.signatures.map(sig => ({
+                            id: uuidv4(),
+                            documentId: doc.id,
+                            documentName: doc.name,
+                            pageIndex: sigPage.pageIndex,
+                            pageNumber: sigPage.pageIndex + 1,
+                            partyName: sig.partyName || "Unknown Party",
+                            signatoryName: sig.signatoryName || "",
+                            capacity: sig.capacity || "Signatory",
+                            copies: 1,
+                            thumbnailUrl: dataUrl,
+                            originalWidth: width,
+                            originalHeight: height
+                        }));
                     } catch (err) {
-                        console.error(`Error analyzing page ${pageIndex} of ${doc.name}`, err);
+                        console.error(`Error extracting metadata from page ${sigPage.pageIndex} of ${doc.name}`, err);
+                        return [];
                     }
-                    return [];
                 });
 
                 const chunkResults = await Promise.all(chunkPromises);
-                
-                // Update progress for AI phase (30-100%)
+
+                // Update progress for AI phase (50-100%)
                 processedCount += chunk.length;
-                const aiProgress = 30 + Math.round((processedCount / totalCandidates) * 70);
+                const aiProgress = 50 + Math.round((processedCount / totalPages) * 50);
                 setDocuments(prev => prev.map(d => d.id === doc.id ? { ...d, progress: aiProgress } : d));
 
                 // Flatten and add to results
@@ -155,12 +175,12 @@ const App: React.FC = () => {
             }
         }
 
-        setDocuments(prev => prev.map(d => d.id === doc.id ? { 
-          ...d, 
-          status: 'completed', 
+        setDocuments(prev => prev.map(d => d.id === doc.id ? {
+          ...d,
+          status: 'completed',
           progress: 100,
           pageCount,
-          extractedPages 
+          extractedPages
         } : d));
 
       } catch (error) {

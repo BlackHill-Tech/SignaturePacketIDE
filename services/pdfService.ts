@@ -62,6 +62,181 @@ export const getPageCount = async (file: File): Promise<number> => {
 };
 
 /**
+ * Scoring thresholds for signature page detection
+ */
+const SIGNATURE_PAGE_THRESHOLD = 3; // Minimum score to be considered a signature page
+
+/**
+ * Signature detection patterns with weighted scoring.
+ * Higher weights = stronger indicators of a signature page.
+ */
+const SIGNATURE_PATTERNS: Array<{ pattern: RegExp; weight: number; name: string }> = [
+  // Strong indicators (execution block headers) - weight 3
+  { pattern: /EXECUTED\s+(by|as\s+a\s+deed)/i, weight: 3, name: 'EXECUTED header' },
+  { pattern: /EXECUTION\s+PAGE/i, weight: 3, name: 'EXECUTION PAGE' },
+  { pattern: /SIGNATURE\s+PAGE/i, weight: 3, name: 'SIGNATURE PAGE' },
+  { pattern: /IN\s+WITNESS\s+WHEREOF/i, weight: 3, name: 'IN WITNESS WHEREOF' },
+
+  // Medium indicators (signature block structure) - weight 2
+  { pattern: /(?:Signed|Executed)\s+(?:by|for\s+and\s+on\s+behalf\s+of)/i, weight: 2, name: 'Signed by/for' },
+  { pattern: /Authorised\s+Signatory/i, weight: 2, name: 'Authorised Signatory' },
+  { pattern: /Authorized\s+Signatory/i, weight: 2, name: 'Authorized Signatory' },
+  { pattern: /Duly\s+Authorised/i, weight: 2, name: 'Duly Authorised' },
+  { pattern: /Duly\s+Authorized/i, weight: 2, name: 'Duly Authorized' },
+  { pattern: /Agreed\s+and\s+Accepted/i, weight: 2, name: 'Agreed and Accepted' },
+  { pattern: /Acknowledged\s+by/i, weight: 2, name: 'Acknowledged by' },
+  { pattern: /Accepted\s+by/i, weight: 2, name: 'Accepted by' },
+
+  // Signature block field labels - weight 1
+  { pattern: /\bSignature\s*:/i, weight: 1, name: 'Signature:' },
+  { pattern: /\bName\s*:/i, weight: 1, name: 'Name:' },
+  { pattern: /\bTitle\s*:/i, weight: 1, name: 'Title:' },
+  { pattern: /\bPosition\s*:/i, weight: 1, name: 'Position:' },
+  { pattern: /\bDate\s*:/i, weight: 1, name: 'Date:' },
+  { pattern: /\bWitness\s*:/i, weight: 1, name: 'Witness:' },
+
+  // Entity execution patterns - weight 2
+  { pattern: /(?:for\s+and\s+on\s+behalf\s+of|on\s+behalf\s+of)\s+[A-Z]/i, weight: 2, name: 'on behalf of' },
+  { pattern: /(?:acting\s+by|represented\s+by)/i, weight: 2, name: 'acting by/represented by' },
+
+  // Common execution block closings - weight 1
+  { pattern: /\bDirector\b/i, weight: 1, name: 'Director' },
+  { pattern: /\bSecretary\b/i, weight: 1, name: 'Secretary' },
+  { pattern: /\bGeneral\s+Partner\b/i, weight: 1, name: 'General Partner' },
+  { pattern: /\bManaging\s+Member\b/i, weight: 1, name: 'Managing Member' },
+];
+
+/**
+ * Negative patterns that indicate this is NOT a signature page
+ * (e.g., references to signatures in body text)
+ */
+const NEGATIVE_PATTERNS: Array<{ pattern: RegExp; weight: number; name: string }> = [
+  { pattern: /signature\s+(?:pages?|blocks?)\s+(?:shall|will|must|should)/i, weight: -2, name: 'signature page reference' },
+  { pattern: /(?:table\s+of\s+)?contents/i, weight: -3, name: 'table of contents' },
+  { pattern: /\bSCHEDULE\s+\d/i, weight: -2, name: 'schedule header' },
+  { pattern: /\bEXHIBIT\s+[A-Z]/i, weight: -2, name: 'exhibit header' },
+  { pattern: /\bAPPENDIX\s+[A-Z\d]/i, weight: -2, name: 'appendix header' },
+];
+
+/**
+ * Calculates a signature page confidence score for the given text.
+ * Returns a score where higher = more likely to be a signature page.
+ */
+const calculateSignatureScore = (text: string): { score: number; matches: string[] } => {
+  let score = 0;
+  const matches: string[] = [];
+
+  // Check positive patterns
+  for (const { pattern, weight, name } of SIGNATURE_PATTERNS) {
+    if (pattern.test(text)) {
+      score += weight;
+      matches.push(`+${weight} ${name}`);
+    }
+  }
+
+  // Check negative patterns
+  for (const { pattern, weight, name } of NEGATIVE_PATTERNS) {
+    if (pattern.test(text)) {
+      score += weight; // weight is already negative
+      matches.push(`${weight} ${name}`);
+    }
+  }
+
+  // Bonus: Check for signature block structure (multiple field labels together)
+  const fieldLabels = ['Name:', 'Title:', 'Date:', 'Signature:'].filter(
+    label => text.toLowerCase().includes(label.toLowerCase())
+  );
+  if (fieldLabels.length >= 2) {
+    score += 2;
+    matches.push(`+2 multiple fields (${fieldLabels.join(', ')})`);
+  }
+
+  return { score, matches };
+};
+
+/**
+ * Determines if a page is a signature page using procedural pattern matching.
+ * This replaces the need to use AI for signature page identification.
+ */
+export interface SignaturePageDetectionResult {
+  pageIndex: number;
+  isSignaturePage: boolean;
+  score: number;
+  matches: string[];
+}
+
+/**
+ * Scans the entire document for signature pages using weighted pattern matching.
+ * Returns confirmed signature pages (not just candidates).
+ * Optimized to process pages in parallel batches.
+ */
+export const findSignaturePages = async (
+  file: File,
+  onProgress?: (processed: number, total: number) => void
+): Promise<SignaturePageDetectionResult[]> => {
+  const arrayBuffer = await readFileAsArrayBuffer(file);
+  const loadingTask = pdfjsLib.getDocument(arrayBuffer);
+  const pdf = await loadingTask.promise;
+  const numPages = pdf.numPages;
+  const signaturePages: SignaturePageDetectionResult[] = [];
+  const BATCH_SIZE = 10;
+
+  let processedCount = 0;
+
+  // Process in batches
+  for (let i = 1; i <= numPages; i += BATCH_SIZE) {
+    const batchPromises = [];
+    const end = Math.min(i + BATCH_SIZE - 1, numPages);
+
+    for (let pageNum = i; pageNum <= end; pageNum++) {
+      batchPromises.push(
+        (async (): Promise<SignaturePageDetectionResult | null> => {
+          try {
+            const page = await pdf.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            const text = textContent.items.map((item: any) => item.str).join(' ');
+
+            // Explicitly release memory
+            page.cleanup();
+
+            const { score, matches } = calculateSignatureScore(text);
+            const isSignaturePage = score >= SIGNATURE_PAGE_THRESHOLD;
+
+            if (isSignaturePage) {
+              return {
+                pageIndex: pageNum - 1, // 0-based index
+                isSignaturePage: true,
+                score,
+                matches
+              };
+            }
+            return null;
+          } catch (e) {
+            console.error(`Error scanning page ${pageNum}`, e);
+            return null;
+          }
+        })()
+      );
+    }
+
+    const results = await Promise.all(batchPromises);
+
+    // Collect confirmed signature pages
+    results.forEach(res => {
+      if (res !== null) signaturePages.push(res);
+    });
+
+    processedCount += (end - i + 1);
+    if (onProgress) {
+      onProgress(processedCount, numPages);
+    }
+  }
+
+  return signaturePages.sort((a, b) => a.pageIndex - b.pageIndex);
+};
+
+/**
+ * @deprecated Use findSignaturePages instead for better accuracy
  * Scans the entire document for pages containing signature-related keywords using Regex.
  * Optimized to process pages in parallel batches to speed up large documents.
  */
@@ -93,7 +268,7 @@ export const findSignaturePageCandidates = async (
             const page = await pdf.getPage(pageNum);
             const textContent = await page.getTextContent();
             const text = textContent.items.map((item: any) => item.str).join(' ');
-            
+
             // Explicitly release memory
             page.cleanup();
 
@@ -110,7 +285,7 @@ export const findSignaturePageCandidates = async (
     }
 
     const results = await Promise.all(batchPromises);
-    
+
     // Collect valid candidates
     results.forEach(res => {
       if (res !== null) candidatePages.push(res);
